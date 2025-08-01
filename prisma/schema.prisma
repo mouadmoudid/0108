@@ -1,0 +1,239 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+  SUPER_ADMIN
+  DELIVERY_GUY
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  IN_PROGRESS
+  READY_FOR_PICKUP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  COMPLETED
+  CANCELED
+  REFUNDED
+}
+
+enum LaundryStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum ActivityType {
+  ORDER_CREATED
+  ORDER_UPDATED
+  ORDER_COMPLETED
+  ORDER_CANCELED
+  LAUNDRY_REGISTERED
+  LAUNDRY_UPDATED
+  LAUNDRY_SUSPENDED
+  LAUNDRY_ACTIVATED
+  REVIEW_ADDED
+  USER_REGISTERED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  phone     String?
+  role      UserRole @default(CUSTOMER)
+  avatar    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  addresses Address[]
+  orders    Order[]
+  reviews   Review[]
+  laundry   Laundry? // For admin users
+
+  @@map("users")
+  Activity Activity[]
+}
+
+model Address {
+  id          String  @id @default(cuid())
+  street      String
+  city        String
+  state       String
+  zipCode     String
+  country     String  @default("Morocco")
+  isDefault   Boolean @default(false)
+  latitude    Float?
+  longitude   Float?
+  userId      String
+  laundryId   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  laundry Laundry? @relation(fields: [laundryId], references: [id])
+  orders  Order[]
+
+  @@map("addresses")
+}
+
+model Laundry {
+  id            String        @id @default(cuid())
+  name          String
+  email         String        @unique
+  phone         String
+  description   String?
+  logo          String?
+  status        LaundryStatus @default(ACTIVE)
+  rating        Float         @default(0.0)
+  totalReviews  Int           @default(0)
+  totalOrders   Int           @default(0)
+  totalRevenue  Float         @default(0.0)
+  adminId       String        @unique
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // Operating Hours (JSON format)
+  operatingHours Json? // {"monday": {"open": "08:00", "close": "18:00", "closed": false}, ...}
+
+  // Relations
+  admin     User        @relation(fields: [adminId], references: [id])
+  addresses Address[]
+  products  Product[]
+  orders    Order[]
+  reviews   Review[]
+  activities Activity[]
+
+  @@map("laundries")
+}
+
+model Product {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  price       Float
+  unit        String  @default("piece") // piece, kg, item
+  category    String  // washing, drying, ironing, etc.
+  isActive    Boolean @default(true)
+  laundryId   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  laundry    Laundry     @relation(fields: [laundryId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@map("products")
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique
+  status          OrderStatus @default(PENDING)
+  totalAmount     Float
+  deliveryFee     Float       @default(0.0)
+  discount        Float       @default(0.0)
+  finalAmount     Float
+  notes           String?
+  pickupDate      DateTime?
+  deliveryDate    DateTime?
+  customerId      String
+  laundryId       String
+  addressId       String
+  deliveryGuyId   String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  // Relations
+  customer    User        @relation(fields: [customerId], references: [id])
+  laundry     Laundry     @relation(fields: [laundryId], references: [id])
+  address     Address     @relation(fields: [addressId], references: [id])
+  orderItems  OrderItem[]
+  activities  Activity[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String @id @default(cuid())
+  quantity  Int
+  price     Float
+  totalPrice Float
+  orderId   String
+  productId String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("order_items")
+}
+
+model Review {
+  id        String   @id @default(cuid())
+  rating    Int      // 1-5 stars
+  comment   String?
+  customerId String
+  laundryId String
+  orderId   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  customer User     @relation(fields: [customerId], references: [id])
+  laundry  Laundry  @relation(fields: [laundryId], references: [id])
+
+  @@map("reviews")
+}
+
+model Activity {
+  id          String       @id @default(cuid())
+  type        ActivityType
+  title       String
+  description String?
+  metadata    Json?        // Additional data related to the activity
+  userId      String?
+  laundryId   String?
+  orderId     String?
+  createdAt   DateTime     @default(now())
+
+  // Relations
+  user    User?    @relation(fields: [userId], references: [id])
+  laundry Laundry? @relation(fields: [laundryId], references: [id])
+  order   Order?   @relation(fields: [orderId], references: [id])
+
+  @@map("activities")
+}
+
+// Analytics can be computed from other tables, but we can store some aggregated data
+model Analytics {
+  id                String   @id @default(cuid())
+  date              DateTime @db.Date
+  totalOrders       Int      @default(0)
+  totalRevenue      Float    @default(0.0)
+  totalUsers        Int      @default(0)
+  totalLaundries    Int      @default(0)
+  averageOrderValue Float    @default(0.0)
+  laundryId         String?  // If analytics are per laundry
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([date, laundryId])
+  @@map("analytics")
+}
