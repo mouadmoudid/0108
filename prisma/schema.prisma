@@ -37,6 +37,7 @@ enum LaundryStatus {
 
 enum ActivityType {
   ORDER_CREATED
+  ORDER_DELIVERED
   ORDER_UPDATED
   ORDER_COMPLETED
   ORDER_CANCELED
@@ -164,6 +165,7 @@ model Order {
   address     Address     @relation(fields: [addressId], references: [id])
   orderItems  OrderItem[]
   activities  Activity[]
+  reviews     Review[]
 
   @@map("orders")
 }
@@ -198,6 +200,7 @@ model Review {
   // Relations
   customer User     @relation(fields: [customerId], references: [id])
   laundry  Laundry  @relation(fields: [laundryId], references: [id])
+  order    Order?   @relation(fields: [orderId], references: [id])
 
   @@map("reviews")
 }
