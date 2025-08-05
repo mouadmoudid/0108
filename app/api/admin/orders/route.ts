@@ -1,8 +1,7 @@
-// app/api/admin/orders/route.ts
+// app/api/admin/orders/route.ts - ADMIN uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
 // Query schema for orders
@@ -19,59 +18,74 @@ const ordersQuerySchema = z.object({
 })
 
 export async function GET(request: NextRequest) {
+  // Vérifier que l'utilisateur est ADMIN UNIQUEMENT
+  const authResult = await requireRole(request, ['ADMIN'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult // Erreur d'authentification ou d'autorisation
+  }
+
+  const { user } = authResult
+
+  // Vérifier que user.sub existe
+  if (!user.sub) {
+    return NextResponse.json(
+      { success: false, message: 'Invalid user session' },
+      { status: 401 }
+    )
+  }
+
   try {
-    const { searchParams } = new URL(request.url)
-    const laundryId = searchParams.get('laundryId')
-
-    if (!laundryId) {
-      return errorResponse('laundryId parameter is required', 400)
-    }
-
-    // Verify laundry exists
-    const laundry = await prisma.laundry.findUnique({
-      where: { id: laundryId }
+    // Vérifier que l'admin a une laundry associée
+    const adminUser = await prisma.user.findUnique({
+      where: { id: user.sub },
+      include: { laundry: true }
     })
 
-    if (!laundry) {
-      return errorResponse('Laundry not found', 404)
+    if (!adminUser?.laundry) {
+      return NextResponse.json(
+        { success: false, message: 'Admin must be associated with a laundry' },
+        { status: 403 }
+      )
     }
 
-    // Validate query parameters
+    const laundryId = adminUser.laundry.id
+
+    // Valider les paramètres de requête
+    const { searchParams } = new URL(request.url)
     const queryParams = Object.fromEntries(searchParams.entries())
-    delete queryParams.laundryId // Remove laundryId from validation
 
-    const validatedQuery = validateQuery(ordersQuerySchema, queryParams)
-    if (!validatedQuery) {
-      return errorResponse('Invalid query parameters', 400)
+    const parsed = ordersQuerySchema.safeParse(queryParams)
+    if (!parsed.success) {
+      return NextResponse.json(
+        { 
+          success: false, 
+          message: 'Invalid query parameters', 
+          errors: parsed.error.errors 
+        },
+        { status: 400 }
+      )
     }
 
-    const { page = 1, limit = 20, status, service, search, startDate, endDate, sortBy = 'createdAt', sortOrder = 'desc' } = validatedQuery
+    const { page, limit, status, service, search, startDate, endDate, sortBy, sortOrder } = parsed.data
 
-    // Build where conditions
+    // Construire les conditions de filtre
     const whereConditions: any = {
-      laundryId
+      laundryId // Un admin ne voit que les commandes de sa laundry
     }
 
-    // Filter by status
     if (status) {
       whereConditions.status = status
     }
 
-    // Filter by service (product category)
-    if (service) {
-      whereConditions.orderItems = {
-        some: {
-          product: {
-            category: {
-              contains: service,
-              mode: 'insensitive'
-            }
-          }
-        }
-      }
+    if (search) {
+      whereConditions.OR = [
+        { orderNumber: { contains: search, mode: 'insensitive' } },
+        { customer: { name: { contains: search, mode: 'insensitive' } } },
+        { customer: { email: { contains: search, mode: 'insensitive' } } }
+      ]
     }
 
-    // Filter by date range
     if (startDate || endDate) {
       whereConditions.createdAt = {}
       if (startDate) {
@@ -82,175 +96,111 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Search functionality
-    if (search) {
-      whereConditions.OR = [
-        {
-          orderNumber: {
-            contains: search,
-            mode: 'insensitive'
-          }
-        },
-        {
+    // Récupérer les commandes avec pagination
+    const [orders, totalCount] = await Promise.all([
+      prisma.order.findMany({
+        where: whereConditions,
+        include: {
           customer: {
-            name: {
-              contains: search,
-              mode: 'insensitive'
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              phone: true
             }
-          }
-        },
-        {
-          customer: {
-            email: {
-              contains: search,
-              mode: 'insensitive'
+          },
+          address: {
+            select: {
+              street: true,
+              city: true,
+              state: true,
+              zipCode: true
             }
-          }
-        }
-      ]
-    }
-
-    // Calculate offset
-    const offset = (page - 1) * limit
-
-    // Get total count for pagination
-    const totalCount = await prisma.order.count({
-      where: whereConditions
-    })
-
-    // Get orders with pagination and sorting
-    const orderByClause: Record<string, 'asc' | 'desc'> = {}
-    orderByClause[sortBy] = sortOrder
-
-    const orders = await prisma.order.findMany({
-      where: whereConditions,
-      include: {
-        customer: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            avatar: true
-          }
-        },
-        orderItems: {
-          include: {
-            product: {
-              select: {
-                id: true,
-                name: true,
-                category: true
+          },
+          orderItems: {
+            include: {
+              product: {
+                select: {
+                  name: true,
+                  category: true,
+                  unit: true
+                }
               }
             }
+          },
+          _count: {
+            select: {
+              orderItems: true
+            }
           }
         },
-        address: {
-          select: {
-            street: true,
-            city: true,
-            state: true
-          }
+        orderBy: {
+          [sortBy]: sortOrder
+        },
+        skip: (page - 1) * limit,
+        take: limit
+      }),
+      prisma.order.count({ where: whereConditions })
+    ])
+
+    const totalPages = Math.ceil(totalCount / limit)
+
+    // Formater les données
+    const formattedOrders = orders.map(order => ({
+      id: order.id,
+      orderNumber: order.orderNumber,
+      status: order.status,
+      customer: order.customer,
+      address: order.address,
+      orderSummary: {
+        totalAmount: order.totalAmount,
+        deliveryFee: order.deliveryFee,
+        discount: order.discount,
+        finalAmount: order.finalAmount,
+        itemCount: order._count.orderItems
+      },
+      dates: {
+        orderDate: order.createdAt,
+        pickupDate: order.pickupDate,
+        deliveryDate: order.deliveryDate,
+        lastUpdated: order.updatedAt
+      },
+      notes: order.notes
+    }))
+
+    return NextResponse.json({
+      success: true,
+      message: 'Orders retrieved successfully',
+      data: {
+        orders: formattedOrders,
+        pagination: {
+          page,
+          limit,
+          total: totalCount,
+          totalPages
+        },
+        filters: {
+          laundryId,
+          status,
+          service,
+          search,
+          startDate,
+          endDate
         }
       },
-      orderBy: orderByClause,
-      skip: offset,
-      take: limit
-    })
-
-    // Format orders for response
-    const formattedOrders = orders.map(order => {
-      // Get service categories
-      const services = Array.from(new Set(order.orderItems.map(item => item.product.category)))
-      const primaryService = services[0] || 'General Service'
-      
-      // Calculate total items
-      const totalItems = order.orderItems.reduce((sum, item) => sum + item.quantity, 0)
-      
-      // Calculate days since order
-      const daysSinceOrder = Math.floor(
-        (new Date().getTime() - order.createdAt.getTime()) / (1000 * 60 * 60 * 24)
-      )
-      
-      // Check if overdue
-      const isOverdue = order.deliveryDate && 
-        order.deliveryDate < new Date() && 
-        !['DELIVERED', 'COMPLETED', 'CANCELED'].includes(order.status)
-
-      return {
-        id: order.id,
-        orderNumber: order.orderNumber,
-        customer: {
-          id: order.customer.id,
-          name: order.customer.name || order.customer.email.split('@')[0],
-          email: order.customer.email,
-          avatar: order.customer.avatar
-        },
-        status: order.status,
-        primaryService,
-        services,
-        totalItems,
-        totalAmount: order.finalAmount,
-        deliveryFee: order.deliveryFee,
-        deliveryAddress: {
-          street: order.address.street,
-          city: order.address.city,
-          state: order.address.state
-        },
-        dates: {
-          orderDate: order.createdAt,
-          pickupDate: order.pickupDate,
-          deliveryDate: order.deliveryDate,
-          daysSinceOrder
-        },
-        isOverdue,
-        priority: isOverdue ? 'high' : 
-                 ['PENDING', 'CONFIRMED'].includes(order.status) ? 'medium' : 'normal'
+      requestedBy: {
+        userId: user.sub,
+        role: user.role,
+        laundryId,
+        laundryName: adminUser.laundry.name
       }
     })
 
-    // Calculate pagination info
-    const totalPages = Math.ceil(totalCount / limit)
-    const hasNextPage = page < totalPages
-    const hasPrevPage = page > 1
-
-    // Get summary statistics
-    const statusCounts = await prisma.order.groupBy({
-      by: ['status'],
-      where: { laundryId },
-      _count: { status: true }
-    })
-
-    const statusSummary = statusCounts.reduce((acc, item) => {
-      acc[item.status] = item._count.status
-      return acc
-    }, {} as Record<string, number>)
-
-    const response = {
-      orders: formattedOrders,
-      pagination: {
-        currentPage: page,
-        totalPages,
-        totalCount,
-        limit,
-        hasNextPage,
-        hasPrevPage,
-        showing: formattedOrders.length
-      },
-      summary: {
-        statusCounts: statusSummary,
-        totalOrders: totalCount
-      },
-      filters: {
-        status,
-        service,
-        search,
-        dateRange: startDate || endDate ? { startDate, endDate } : null
-      }
-    }
-
-    return successResponse(response, 'Orders retrieved successfully')
   } catch (error) {
-    console.error('Get orders error:', error)
-    return errorResponse('Failed to retrieve orders', 500)
+    console.error('Admin orders error:', error)
+    return NextResponse.json(
+      { success: false, message: 'Internal server error' },
+      { status: 500 }
+    )
   }
 }

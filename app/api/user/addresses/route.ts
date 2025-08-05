@@ -1,8 +1,7 @@
-// app/api/user/addresses/route.ts
+// app/api/user/addresses/route.ts - CUSTOMER uniquement
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
 // Address creation/update schema
@@ -17,18 +16,27 @@ const addressSchema = z.object({
   longitude: z.number().optional(),
 })
 
-// GET /api/user/addresses?userId=xxx
+// GET /api/user/addresses - CUSTOMER UNIQUEMENT
 export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult // Erreur d'authentification ou d'autorisation
+  }
+
+  const { user } = authResult
+
+  // Vérifier que user.sub existe
+  if (!user.sub) {
+    return NextResponse.json(
+      { success: false, message: 'Invalid user session' },
+      { status: 401 }
+    )
+  }
+
   try {
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-
     const addresses = await prisma.address.findMany({
-      where: { userId },
+      where: { userId: user.sub },
       select: {
         id: true,
         street: true,
@@ -48,58 +56,76 @@ export async function GET(request: NextRequest) {
       ]
     })
 
-    return successResponse(addresses, 'Addresses retrieved successfully')
+    return NextResponse.json({
+      success: true,
+      message: 'Addresses retrieved successfully',
+      data: addresses
+    })
   } catch (error) {
     console.error('Get addresses error:', error)
-    return errorResponse('Failed to retrieve addresses', 500)
+    return NextResponse.json(
+      { success: false, message: 'Failed to retrieve addresses' },
+      { status: 500 }
+    )
   }
 }
 
-// POST /api/user/addresses?userId=xxx
+// POST /api/user/addresses - CUSTOMER UNIQUEMENT
 export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult // Erreur d'authentification ou d'autorisation
+  }
+
+  const { user } = authResult
+
+  // Vérifier que user.sub existe
+  if (!user.sub) {
+    return NextResponse.json(
+      { success: false, message: 'Invalid user session' },
+      { status: 401 }
+    )
+  }
+
   try {
-    const { searchParams } = new URL(request.url)
-    const userId = searchParams.get('userId')
-
-    if (!userId) {
-      return errorResponse('userId parameter is required', 400)
-    }
-    
     const body = await request.json()
-    const validatedData = validateQuery(addressSchema, body)
     
-    if (!validatedData) {
-      return errorResponse('Invalid address data', 400)
+    const parsed = addressSchema.safeParse(body)
+    if (!parsed.success) {
+      return NextResponse.json(
+        { 
+          success: false, 
+          message: 'Validation error', 
+          errors: parsed.error.errors 
+        },
+        { status: 400 }
+      )
     }
 
-    // Verify user exists and is a customer
-    const user = await prisma.user.findUnique({
-      where: { 
-        id: userId,
-        role: 'CUSTOMER' 
-      }
-    })
-
-    if (!user) {
-      return errorResponse('Customer not found', 404)
-    }
-
-    // If this is being set as default, unset all other default addresses
-    if (validatedData.isDefault) {
+    // Si cette adresse est définie comme par défaut, désactiver les autres
+    if (parsed.data.isDefault) {
       await prisma.address.updateMany({
         where: { 
-          userId,
-          isDefault: true
+          userId: user.sub,
+          isDefault: true 
         },
         data: { isDefault: false }
       })
     }
 
-    // Create new address
+    // Créer l'adresse avec userId explicitement défini
     const newAddress = await prisma.address.create({
       data: {
-        ...validatedData,
-        userId
+        userId: user.sub, // user.sub est maintenant garanti d'être une string
+        street: parsed.data.street,
+        city: parsed.data.city,
+        state: parsed.data.state,
+        zipCode: parsed.data.zipCode,
+        country: parsed.data.country,
+        isDefault: parsed.data.isDefault ?? false,
+        latitude: parsed.data.latitude,
+        longitude: parsed.data.longitude,
       },
       select: {
         id: true,
@@ -115,9 +141,17 @@ export async function POST(request: NextRequest) {
       }
     })
 
-    return successResponse(newAddress, 'Address created successfully')
+    return NextResponse.json({
+      success: true,
+      message: 'Address created successfully',
+      data: newAddress
+    }, { status: 201 })
+
   } catch (error) {
     console.error('Create address error:', error)
-    return errorResponse('Failed to create address', 500)
+    return NextResponse.json(
+      { success: false, message: 'Failed to create address' },
+      { status: 500 }
+    )
   }
 }

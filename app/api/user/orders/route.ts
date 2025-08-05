@@ -1,13 +1,11 @@
-// app/api/user/orders/route.ts
+// app/api/user/orders/route.ts - Version corrigée
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { successResponse, errorResponse } from '@/lib/response'
-import { validateQuery } from '@/lib/validations'
-import { NextRequest } from 'next/server'
+import { requireRole } from '@/lib/auth-middleware'
 import { z } from 'zod'
 
 // Order creation schema
 const orderCreateSchema = z.object({
-  userId: z.string().min(1, 'User ID is required'),
   laundryId: z.string().min(1, 'Laundry ID is required'),
   addressId: z.string().min(1, 'Address ID is required'),
   items: z.array(z.object({
@@ -19,31 +17,97 @@ const orderCreateSchema = z.object({
   notes: z.string().optional(),
 })
 
-// POST /api/user/orders
-export async function POST(request: NextRequest) {
+// GET /api/user/orders - Récupérer les commandes de l'utilisateur connecté
+export async function GET(request: NextRequest) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
+  // Vérifier que user.sub existe
+  if (!user.sub) {
+    return NextResponse.json(
+      { success: false, message: 'Invalid user session' },
+      { status: 401 }
+    )
+  }
+
   try {
-    const body = await request.json()
-    const validatedData = validateQuery(orderCreateSchema, body)
-    
-    if (!validatedData) {
-      return errorResponse('Invalid order data', 400)
-    }
-
-    const { userId, laundryId, addressId, items, pickupDate, deliveryDate, notes } = validatedData
-
-    // Verify user exists and is a customer
-    const user = await prisma.user.findUnique({
-      where: { 
-        id: userId,
-        role: 'CUSTOMER' 
-      }
+    // Récupérer les commandes de l'utilisateur connecté
+    const orders = await prisma.order.findMany({
+      where: { customerId: user.sub },
+      include: {
+        laundry: {
+          select: { name: true, phone: true }
+        },
+        address: {
+          select: { street: true, city: true, state: true }
+        },
+        orderItems: {
+          include: {
+            product: {
+              select: { name: true, category: true, unit: true }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
     })
 
-    if (!user) {
-      return errorResponse('Customer not found', 404)
+    return NextResponse.json({
+      success: true,
+      message: 'Orders retrieved successfully',
+      data: orders
+    })
+
+  } catch (error) {
+    console.error('Get orders error:', error)
+    return NextResponse.json(
+      { success: false, message: 'Internal server error' },
+      { status: 500 }
+    )
+  }
+}
+
+// POST /api/user/orders - Créer une nouvelle commande pour l'utilisateur connecté
+export async function POST(request: NextRequest) {
+  const authResult = await requireRole(request, ['CUSTOMER'])
+  
+  if (authResult instanceof NextResponse) {
+    return authResult
+  }
+
+  const { user } = authResult
+
+  // Vérifier que user.sub existe
+  if (!user.sub) {
+    return NextResponse.json(
+      { success: false, message: 'Invalid user session' },
+      { status: 401 }
+    )
+  }
+
+  try {
+    const body = await request.json()
+    
+    const parsed = orderCreateSchema.safeParse(body)
+    if (!parsed.success) {
+      return NextResponse.json(
+        { 
+          success: false, 
+          message: 'Validation error', 
+          errors: parsed.error.errors 
+        },
+        { status: 400 }
+      )
     }
 
-    // Verify laundry exists and is active
+    const { laundryId, addressId, items, pickupDate, deliveryDate, notes } = parsed.data
+
+    // Vérifier que la laundry existe et est active
     const laundry = await prisma.laundry.findUnique({
       where: { 
         id: laundryId,
@@ -52,22 +116,28 @@ export async function POST(request: NextRequest) {
     })
 
     if (!laundry) {
-      return errorResponse('Laundry not found or inactive', 404)
+      return NextResponse.json(
+        { success: false, message: 'Laundry not found or inactive' },
+        { status: 404 }
+      )
     }
 
-    // Verify address belongs to user
+    // Vérifier que l'adresse appartient à l'utilisateur
     const address = await prisma.address.findFirst({
       where: { 
         id: addressId,
-        userId 
+        userId: user.sub 
       }
     })
 
     if (!address) {
-      return errorResponse('Address not found or does not belong to customer', 404)
+      return NextResponse.json(
+        { success: false, message: 'Address not found or does not belong to customer' },
+        { status: 404 }
+      )
     }
 
-    // Get product details and calculate prices
+    // Récupérer les détails des produits
     const products = await prisma.product.findMany({
       where: { 
         id: { in: items.map(item => item.productId) },
@@ -76,102 +146,73 @@ export async function POST(request: NextRequest) {
     })
 
     if (products.length !== items.length) {
-      return errorResponse('Some products not found or not from the selected laundry', 400)
+      return NextResponse.json(
+        { success: false, message: 'Some products not found or not from the selected laundry' },
+        { status: 400 }
+      )
     }
 
-    // Calculate order totals
+    // Calculer le montant total
     let totalAmount = 0
-    const orderItems = items.map(item => {
+    const orderItemsData = items.map(item => {
       const product = products.find(p => p.id === item.productId)!
-      const totalPrice = product.price * item.quantity
-      totalAmount += totalPrice
+      const itemTotal = product.price * item.quantity
+      totalAmount += itemTotal
       
       return {
         productId: item.productId,
         quantity: item.quantity,
         price: product.price,
-        totalPrice
+        totalPrice: itemTotal
       }
     })
 
-    const deliveryFee = 15.00 // Fixed delivery fee
-    const discount = 0 // TODO: Apply any applicable discounts
-    const finalAmount = totalAmount + deliveryFee - discount
+    const deliveryFee = 10.0 // Fee fixe pour l'exemple
+    const finalAmount = totalAmount + deliveryFee
 
-    // Generate order number
-    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`
+    // Générer un numéro de commande unique
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 5).toUpperCase()}`
 
-    // Create order with items in a transaction
-    const order = await prisma.$transaction(async (tx) => {
-      const newOrder = await tx.order.create({
-        data: {
-          orderNumber,
-          customerId: userId,
-          laundryId,
-          addressId,
-          totalAmount,
-          deliveryFee,
-          discount,
-          finalAmount,
-          status: 'PENDING',
-          pickupDate: pickupDate ? new Date(pickupDate) : null,
-          deliveryDate: deliveryDate ? new Date(deliveryDate) : null,
-          notes
+    // Créer la commande avec ses items
+    const order = await prisma.order.create({
+      data: {
+        orderNumber,
+        customerId: user.sub, // user.sub est maintenant garanti d'être une string
+        laundryId,
+        addressId,
+        totalAmount,
+        deliveryFee,
+        finalAmount,
+        notes,
+        pickupDate: pickupDate ? new Date(pickupDate) : null,
+        deliveryDate: deliveryDate ? new Date(deliveryDate) : null,
+        orderItems: {
+          create: orderItemsData
         }
-      })
-
-      // Create order items
-      await tx.orderItem.createMany({
-        data: orderItems.map(item => ({
-          ...item,
-          orderId: newOrder.id
-        }))
-      })
-
-      // Create activity log
-      await tx.activity.create({
-        data: {
-          type: 'ORDER_CREATED',
-          title: 'Order Created',
-          description: `New order ${orderNumber} created by customer`,
-          orderId: newOrder.id,
-          laundryId,
-          userId
-        }
-      })
-
-      return newOrder
-    })
-
-    // Return order with details
-    const orderWithDetails = await prisma.order.findUnique({
-      where: { id: order.id },
+      },
       include: {
         orderItems: {
           include: {
-            product: {
-              select: {
-                name: true,
-                category: true,
-                unit: true
-              }
-            }
+            product: true
           }
         },
         laundry: {
-          select: {
-            name: true,
-            logo: true,
-            phone: true
-          }
-        },
-        address: true
+          select: { name: true }
+        }
       }
     })
 
-    return successResponse(orderWithDetails, 'Order created successfully')
+    return NextResponse.json({
+      success: true,
+      message: 'Order created successfully',
+      data: order
+    }, { status: 201 })
+
   } catch (error) {
     console.error('Create order error:', error)
-    return errorResponse('Failed to create order', 500)
+    return NextResponse.json(
+      { success: false, message: 'Internal server error' },
+      { status: 500 }
+    )
   }
 }
